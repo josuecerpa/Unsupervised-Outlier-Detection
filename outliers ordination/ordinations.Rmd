@@ -1,0 +1,720 @@
+---
+title: "FINAL OrderS"
+author: "Josué Cerpa Araña"
+date: "3 de septiembre de 2019"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(rockchalk) #For mvrnorm
+library(parallel)
+library(doParallel)
+library(foreach)
+library(Matrix)
+library(ggplot2)
+require(reshape2)
+library(robustbase)
+library(gridExtra)
+library(WRS2) #for ben and winsor
+library(ccaPP) #for quandrant correlation
+library(DescTools)
+library(asbio)
+```
+
+```{r}
+mod.01.mag = function(n, m, alpha){
+  domain = seq(0, 2*pi,length=m)
+  mu.add1 = sin(domain)
+  mu.add2 = cos(domain)
+  n.out = rbinom(1, n, alpha)
+  n.good = n - n.out
+  if(n.out > 0){
+    outs = as.integer(seq(from = (n - n.out + 1), to = n, by = 1))
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.good = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    a1 = runif(n.out, 0.75, 1.25)
+    a2 = runif(n.out, 0.75, 1.25)
+    for.out = matrix(rep(0.5, m*n.out), nrow=n.out, ncol=m)
+    sample.out = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2)) + for.out
+    sample.all = rbind(sample.good, sample.out)
+    rownames(sample.all)[outs]=c("mag")
+    rownames(sample.all)[-outs]=c("user")
+  } else {
+    outs = integer(0)
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.all = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    rownames(sample.all)[1:nrow(sample.all)]="user"
+  }
+  return(list("n.out"=n.out, "outs"=outs, "sample"=sample.all))
+}
+```
+
+```{r}
+mod.02.amp = function(n, m, alpha){
+  domain = seq(0, 2*pi,length=m)
+  mu.add1 = sin(domain)
+  mu.add2 = cos(domain)
+  n.out = rbinom(1, n, alpha)
+  n.good = n - n.out
+  if(n.out > 0){
+    outs = as.integer(seq(from = (n - n.out + 1), to = n, by = 1))
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.good = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    a1 = runif(n.out, 1.30, 1.50)
+    a2 = runif(n.out, 1.30, 1.50)
+    sample.out = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    sample.all = rbind(sample.good, sample.out)
+    rownames(sample.all)[outs]=c("amp")
+    rownames(sample.all)[-outs]=c("user")
+  } else {
+    outs = integer(0)
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.all = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    rownames(sample.all)[1:nrow(sample.all)]="user"
+  }
+  return(list("n.out"=n.out, "outs"=outs, "sample"=sample.all))
+}
+```
+
+```{r}
+mod.03.sha = function(n, m, alpha){
+  domain = seq(0, 2*pi,length=m)
+  mu.add1 = sin(domain)
+  mu.add2 = cos(domain)
+  n.out = rbinom(1, n, alpha)
+  n.good = n - n.out
+  if(n.out > 0){
+    outs = as.integer(seq(from = (n - n.out + 1), to = n, by = 1))
+    sd.error = 0.33 # first attempt
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.good = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    a1 = runif(n.out, 0.75, 1.25)
+    a2 = runif(n.out, 0.75, 1.25)
+    sample.out = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2)) + mvrnorm(n = n.out, rep(0, m), diag(rep(sd.error^2, m)))
+    sample.all = rbind(sample.good, sample.out)
+    rownames(sample.all)[outs]=c("shape")
+    rownames(sample.all)[-outs]=c("user")
+  } else {
+    outs = integer(0)
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.all = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    rownames(sample.all)[1:nrow(sample.all)]="user"
+  }
+  return(list("n.out"=n.out, "outs"=outs, "sample"=sample.all))
+}
+```
+
+
+#Shape indexes
+
+```{r}
+#With tau kendall
+is.kendall =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Shape index =
+  is=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    #tau-1
+    tau=cor(mtx, mtx[,splits[[i]]],method = "kendall",use="pairwise.complete.obs")-1
+    #mean and absolute value to the tau correlation matrix
+    tau.mean=abs(colMeans(tau,na.rm=T))
+  }
+  stopCluster(cluster)
+  return(is)
+}
+```
+
+```{r}
+is.biweight =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Users' median
+  MEDIAN=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,median)
+  }
+  #Users' mad
+  MAD=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,mad)
+  }
+  #Computation biweight midcovariance#######################
+  ui=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    numerator=t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]]
+    denominator=9*qnorm(0.75)*MAD[splits[[i]]]
+    result=t(numerator/denominator)
+  }
+  ai=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=ui[,splits[[i]]]
+    I1[(-1<=I1) & (I1<=1)]=1
+    I1[(I1< -1) | I1 > 1]=0
+    I1
+  }
+  
+  minusmedian=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    #In ordert to compute user-median(user) we need to make the transpose
+    #of the user's matrix and the end we transpose again.
+    t(t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]])
+  }
+
+  biwmidcov=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:length(splits),.combine='c') %dopar% {
+    #Elements numerator############  
+    ai.x=matrix(ai[,i],ncol = 1)
+    minusmedian.x=matrix(minusmedian[,i],ncol=1)
+    ui.x=(1-matrix(ui[,i],ncol=1)^2)
+    bi.y=data.frame(ai[,splits[[j]]])
+    minusmedian.y=data.frame(minusmedian[,splits[[j]]])
+    vi.y=data.frame((1-ui[,splits[[j]]]^2))
+    
+    #Elements denominator###########
+    ui5.x=(1-5*matrix(ui[,i],ncol=1)^2)
+    vi5.y=data.frame((1-5*ui[,splits[[j]]]^2))
+    
+    #biweight midcovariance
+    numerator.1=ai.x * minusmedian.x * ui.x^2 * bi.y * minusmedian.y *vi.y^2
+    numerator.1.1=nrow(mtx)*apply(numerator.1,2,sum)
+    
+    denominator.1=sum(ai.x * ui.x * ui5.x)
+    denominator.2=bi.y * vi.y * vi5.y 
+    denominator.2.1=apply(denominator.2,2,sum)
+    
+    sbxy=numerator.1.1/(denominator.1 * denominator.2.1)
+    }
+  
+  ai.midvariance=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=abs(ui[,splits[[i]]])
+    I1[I1<1]=1
+    I1[!(I1=1)]=0
+    I1
+  }
+  
+  biwmidvar=foreach(i=1:length(splits),.combine='c') %dopar% {
+    numerator1=ai.midvariance[,splits[[i]]]*minusmedian[,splits[[i]]]^2 *(1-ui[,splits[[i]]]^2)^4
+    numerator1.1=sqrt(apply(numerator1,2,sum))
+    
+    denominator1=ai.midvariance[,splits[[i]]] * (1-ui[,splits[[i]]]^2) * (1-5*ui[,splits[[i]]]^2)
+    denominator1.1=abs(apply(denominator1,2,sum))
+    
+    ((sqrt(nrow(mtx))*numerator1.1)/denominator1.1)^2
+  }
+  
+  biwmidcor=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:ncol(mtx),.combine='c') %dopar% {
+      biwmidcov[i,j]/sqrt(biwmidvar[i]*biwmidvar[j])
+    }
+  is=foreach(i=1:length(splits),.combine='c') %dopar% {
+    unname(abs(colMeans(biwmidcor[,splits[[i]]]-1)))
+  }
+  stopCluster(cluster)
+  return(is)
+}
+```
+
+```{r}
+is.pearson =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  is=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    #pearson-1
+    pearson=cor(mtx, mtx[,splits[[i]]],method = "pearson",use="pairwise.complete.obs")-1
+    #mean and absolute value to the pearson correlation matrix
+    pearson.mean=abs(colMeans(pearson,na.rm=T))
+  }
+  stopCluster(cluster)
+  return(is)
+}
+```
+
+```{r}
+shape.outliers=function(model){
+  data=model
+  nout=data$n.out
+  pout=data$outs
+  sample=t(data$sample)
+  pearson=sort(is.pearson(sample))
+  kendall=sort(is.kendall(sample))
+  biweight=is.biweight(sample)
+  names(biweight)=colnames(sample)
+  biweight=sort(biweight)
+  outs.pearson=length(which(names(pearson)[pout]=="shape"))/nout
+  outs.kendall=length(which(names(kendall)[pout]=="shape"))/nout
+  outs.biweight=length(which(names(biweight)[pout]=="shape"))/nout
+  result=data.frame(pearson=outs.pearson,tau=outs.kendall,biweight=outs.biweight)
+return(result)
+}
+```
+
+```{r}
+datos=data.frame()
+i=1
+while(i<101){
+  model=mod.03.sha(100,25,0.05)
+  if(model$n.out!=0){
+    r=shape.outliers(model)
+    datos=rbind(datos,r)
+    i=i+1
+  }
+}
+ggplot(data = melt(datos), aes(x=variable, y=value)) + 
+  geom_boxplot()+
+  coord_flip()+
+  xlab("")+
+  ylab("")+
+  ggtitle("Order mixture model 3 (shape)")+
+  theme(plot.title = element_text(hjust = 0.5))
+results1=apply(datos,2,mean)
+```
+
+##Summary shape indexes 
+
+```{r}
+names(results1)=c("MUOD_sha","kendall","Biweight")
+results1
+```
+
+#Amplitude indexes
+
+
+```{r}
+iamp.default= function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Variance of each user (by columns)
+  variance=parApply(cluster,mtx,2,var)
+  #is: computes a matrix which each column is the (cov(x,x_j)/var(x_j))-1
+  is=foreach(i=1:length(splits),.combine = 'cbind')  %dopar% {
+    #covx.varxj calculates cov(x,x_j)/var(x_j)
+    covx.varxj=data.frame(cov(mtx,mtx[,splits[[i]]],use="pairwise.complete.obs"))/
+      matrix(variance,ncol=1)
+    #computes (cov(x,x_j)/var(x_j)) - 1
+    result=covx.varxj-1
+  }
+  #ia:applies the the column mean and the absolute value 
+  #for the square matrix is
+  ia=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+   abs(colMeans(is[,splits[[i]]]))
+ }
+ stopCluster(cluster)
+ names(ia)[grepl("amp",names(ia))]="amp"
+ names(ia)[grepl("user",names(ia))]="user"
+ return(ia)
+}
+```
+
+```{r}
+iamp.kendall =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #is:computes the column mean for the kendall-tau correlation
+  is=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    colMeans(
+      cor(mtx, mtx[,splits[[i]]],method = "kendall",use="pairwise.complete.obs"), 
+      na.rm=T)
+  }
+  #MAD of each user (by columns)
+  MAD=parApply(cl=cluster,MARGIN=2,X=mtx,FUN=mad)
+  #ia:computes tau(x,xj)*MAD(x)
+  ia=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    abs(is[splits[[i]]] * (MAD[splits[[i]]]/1.4826))
+  }
+  stopCluster(cluster)
+  #result=data.frame(kendall=names(sort(ia)),Iampkendall=sort(ia))
+  #result$kendall[grepl("a",result$kendall)]="amp"
+  names(ia)[grepl("amp",names(ia))]="amp"
+  names(ia)[grepl("user",names(ia))]="user"
+  return(ia)
+}
+```
+
+```{r}
+iamp.biweight =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Users' median
+  MEDIAN=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,median)
+  }
+  #Users' mad
+  MAD=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,mad)
+  }
+  #Computation biweight midcovariance#######################
+  ui=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    numerator=t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]]
+    denominator=9*qnorm(0.75)*MAD[splits[[i]]]
+    result=t(numerator/denominator)
+  }
+  ai=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=ui[,splits[[i]]]
+    I1[(-1<=I1) & (I1<=1)]=1
+    I1[(I1< -1) | I1 > 1]=0
+    I1
+  }
+  minusmedian=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    #In ordert to compute user-median(user) we need to make the transpose
+    #of the user's matrix and the end we transpose again.
+    t(t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]])
+  }
+  biwmidcov=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:length(splits),.combine='c') %dopar% {
+    #Elements numerator############  
+    ai.x=matrix(ai[,i],ncol = 1)
+    minusmedian.x=matrix(minusmedian[,i],ncol=1)
+    ui.x=(1-matrix(ui[,i],ncol=1)^2)
+    bi.y=data.frame(ai[,splits[[j]]])
+    minusmedian.y=data.frame(minusmedian[,splits[[j]]])
+    vi.y=data.frame((1-ui[,splits[[j]]]^2))
+    
+    #Elements denominator###########
+    ui5.x=(1-5*matrix(ui[,i],ncol=1)^2)
+    vi5.y=data.frame((1-5*ui[,splits[[j]]]^2))
+    
+    #biweight midcovariance
+    numerator.1=ai.x * minusmedian.x * ui.x^2 * bi.y * minusmedian.y *vi.y^2
+    numerator.1.1=nrow(mtx)*apply(numerator.1,2,sum)
+    
+    denominator.1=sum(ai.x * ui.x * ui5.x)
+    denominator.2=bi.y * vi.y * vi5.y 
+    denominator.2.1=apply(denominator.2,2,sum)
+    
+    sbxy=numerator.1.1/(denominator.1 * denominator.2.1)
+    }
+  ai.midvariance=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=abs(ui[,splits[[i]]])
+    I1[I1<1]=1
+    I1[!(I1=1)]=0
+    I1
+  }
+  biwmidvar=foreach(i=1:length(splits),.combine='c') %dopar% {
+    numerator1=ai.midvariance[,splits[[i]]]*minusmedian[,splits[[i]]]^2 *(1-ui[,splits[[i]]]^2)^4
+    numerator1.1=sqrt(apply(numerator1,2,sum))
+    
+    denominator1=ai.midvariance[,splits[[i]]] * (1-ui[,splits[[i]]]^2) * (1-5*ui[,splits[[i]]]^2)
+    denominator1.1=abs(apply(denominator1,2,sum))
+    
+    ((sqrt(nrow(mtx))*numerator1.1)/denominator1.1)^2
+  }
+  
+  biwmidcor=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:ncol(mtx),.combine='c') %dopar% {
+      biwmidcov[i,j]/sqrt(biwmidvar[i]*biwmidvar[j])
+    }
+  is=foreach(i=1:length(splits),.combine='c') %dopar% {
+    colMeans(biwmidcor[,splits[[i]]])
+  }
+  ia=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    abs(is[splits[[i]]] * (MAD[splits[[i]]]))
+    }
+  stopCluster(cluster)
+  names(ia)=colnames(mtx)
+  return(ia)
+}
+```
+
+
+```{r}
+amplitude.outliers=function(model){
+  data=model
+  nout=data$n.out
+  pout=data$outs
+  sample=t(data$sample)
+  pearson=sort(iamp.default(sample))
+  kendall=sort(iamp.kendall(sample))
+  biweight=sort(iamp.biweight(sample))
+  outs.pearson=length(which(names(pearson)[pout]=="amp"))/nout
+  outs.kendall=length(which(names(kendall)[pout]=="amp"))/nout
+  outs.biweight=length(which(names(biweight)[pout]=="amp"))/nout
+  result=data.frame(pearson=outs.pearson,tau=outs.kendall,biweight=outs.biweight)
+return(result)
+}
+```
+
+
+```{r}
+datos=data.frame()
+i=1
+while(i<101){
+  model=mod.02.amp(100,25,0.05)
+  if(model$n.out!=0){
+    r=amplitude.outliers(model)
+    datos=rbind(datos,r)
+    i=i+1
+  }
+}
+ggplot(data = melt(datos), aes(x=variable, y=value))+ 
+  geom_boxplot()+
+  coord_flip()+
+  xlab("")+
+  ylab("")+
+  ggtitle("Order mixture model 2 (amplitude)")+
+  theme(plot.title = element_text(hjust = 0.5))
+results2=apply(datos,2,mean)
+```
+
+##Summary amplitude indexes 
+
+```{r}
+names(results2)=c("MUOD_amp","kendall","Biweight")
+results2
+```
+
+#Magnitude indexes 
+
+
+```{r}
+imag.default= function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Mean of each user (by columns)
+  meancol=parApply(cl=cluster,MARGIN=2,X=mtx,FUN=mean)
+  #Variance of each user (by columns)
+  variance=parApply(cl=cluster,MARGIN=2,X=mtx,FUN=var)
+  #computes the (cov(x,x_j)/var(x_j)) * mean(x_j)
+   b.med=foreach(i=1:length(splits),.combine = 'cbind')  %dopar% {
+     #covariance matrix
+     cov=data.frame(cov(mtx, mtx[,splits[[i]]],use="pairwise.complete.obs"))
+     #variance of each user, as column, necessary for doing the computations
+     var=matrix(variance,ncol=1)
+     #(cov(x,x_j)/var(x_j)) * median(x_j)
+     fresult=(cov/var)*matrix(meancol,ncol=1)
+   }
+   #Calculates mean(x)-beta_j * x_j
+   im=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+     #splits of mean's users
+     Mean=meancol[splits[[i]]]
+     #beta(cov(x,x_j)/var(x_j)) per mean(x_j)
+     betaperxj=t(b.med[,splits[[i]]])
+     #mean(x)-beta_j * mean(x_j)
+     index=t(Mean-betaperxj)
+     #colmean and absolute value of the index
+     fresult= abs(colMeans(index))
+   }
+   stopCluster(cluster)
+   #result=data.frame(magdefault=names(sort(im)),Imagdefault=sort(im))
+   #result$magdefault[grepl("m",result$magdefault)]="mag"
+   names(im)[grepl("mag",names(im))]="mag"
+   names(im)[grepl("user",names(im))]="user"
+   return(im)
+}
+```
+
+```{r}
+imag.kendall =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #tau correlation matrix 
+  tau=foreach(i=1:length(splits),.combine = 'cbind')  %dopar% {
+    cor(mtx, mtx[,splits[[i]]],method = "kendall",use="pairwise.complete.obs")
+  }
+  #median of each user (by column)
+  mediancol=parApply(cl=cluster,MARGIN=2,X=mtx,FUN=median)
+  #MAD of each user (by column)
+  MAD=parApply(cl=cluster,MARGIN=2,X=mtx,FUN=mad)
+  #computes the index
+  imag=foreach(i=1:length(splits),.combine = 'c') %dopar%{
+    #median's users
+    median=mediancol[splits[[i]]]
+    #transpose of tau correlation
+    kendall=t(tau[,splits[[i]]])
+    #computation of the MAD
+    MADs=MAD[splits[[i]]]
+    #kendall(x,x_j)*MAD(X)
+    taupermads=data.frame(t(kendall*MADs))
+    #kendall(x,x_j)*MAD(x)*median(x_j)
+    tau.mads.medianj=t(taupermads*matrix(mediancol,ncol=1))
+    #median(x)-kendall(x,x_j)*MAD(x)*median(x_j)
+    index=t(median-tau.mads.medianj)
+    #absolute value of the index
+    fresults=abs(colMeans(index))
+    }
+  stopCluster(cluster)
+  #result=data.frame(magkendall=names(sort(imag)),Imagkendall=sort(imag))
+  #result$magkendall[grepl("m",result$magkendall)]="mag"
+  names(imag)[grepl("mag",names(imag))]="mag"
+  names(imag)[grepl("user",names(imag))]="user"
+  return(imag)
+}
+```
+
+```{r}
+imag.biweight =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Users' median
+  MEDIAN=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,median)
+  }
+  #Users' mad
+  MAD=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,mad)
+  }
+  #Computation biweight midcovariance#######################
+  ui=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    numerator=t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]]
+    denominator=9*qnorm(0.75)*MAD[splits[[i]]]
+    result=t(numerator/denominator)
+  }
+  ai=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=ui[,splits[[i]]]
+    I1[(-1<=I1) & (I1<=1)]=1
+    I1[(I1< -1) | I1 > 1]=0
+    I1
+  }
+  minusmedian=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    #In ordert to compute user-median(user) we need to make the transpose
+    #of the user's matrix and the end we transpose again.
+    t(t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]])
+  }
+  biwmidcov=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:length(splits),.combine='c') %dopar% {
+    #Elements numerator############  
+    ai.x=matrix(ai[,i],ncol = 1)
+    minusmedian.x=matrix(minusmedian[,i],ncol=1)
+    ui.x=(1-matrix(ui[,i],ncol=1)^2)
+    bi.y=data.frame(ai[,splits[[j]]])
+    minusmedian.y=data.frame(minusmedian[,splits[[j]]])
+    vi.y=data.frame((1-ui[,splits[[j]]]^2))
+    
+    #Elements denominator###########
+    ui5.x=(1-5*matrix(ui[,i],ncol=1)^2)
+    vi5.y=data.frame((1-5*ui[,splits[[j]]]^2))
+    
+    #biweight midcovariance
+    numerator.1=ai.x * minusmedian.x * ui.x^2 * bi.y * minusmedian.y *vi.y^2
+    numerator.1.1=nrow(mtx)*apply(numerator.1,2,sum)
+    
+    denominator.1=sum(ai.x * ui.x * ui5.x)
+    denominator.2=bi.y * vi.y * vi5.y 
+    denominator.2.1=apply(denominator.2,2,sum)
+    
+    sbxy=numerator.1.1/(denominator.1 * denominator.2.1)
+    }
+  ai.midvariance=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=abs(ui[,splits[[i]]])
+    I1[I1<1]=1
+    I1[!(I1=1)]=0
+    I1
+  }
+  biwmidvar=foreach(i=1:length(splits),.combine='c') %dopar% {
+    numerator1=ai.midvariance[,splits[[i]]]*minusmedian[,splits[[i]]]^2 *(1-ui[,splits[[i]]]^2)^4
+    numerator1.1=sqrt(apply(numerator1,2,sum))
+    
+    denominator1=ai.midvariance[,splits[[i]]] * (1-ui[,splits[[i]]]^2) * (1-5*ui[,splits[[i]]]^2)
+    denominator1.1=abs(apply(denominator1,2,sum))
+    
+    ((sqrt(nrow(mtx))*numerator1.1)/denominator1.1)^2
+  }
+  
+  biwmidcor=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:ncol(mtx),.combine='c') %dopar% {
+      biwmidcov[i,j]/sqrt(biwmidvar[i]*biwmidvar[j])
+    }
+  #computes the index
+  imag=foreach(i=1:length(splits),.combine = 'c') %dopar%{
+    #median's users
+    median=MEDIAN[splits[[i]]]
+    #transpose of biweight correlation
+    biweight=t(biwmidcor[,splits[[i]]])
+    #computation of the MAD
+    MADs=MAD[splits[[i]]]
+    #biweight(x,x_j)*MAD(X)
+    biwepermads=data.frame(t(biweight*MADs))
+    #biweight(x,x_j)*MAD(x)*median(x_j)
+    biw.mads.medianj=t(biwepermads*matrix(MEDIAN,ncol=1))
+    #median(x)-kendall(x,x_j)*MAD(x)*median(x_j)
+    index=t(median-biw.mads.medianj)
+    #absolute value of the index
+    fresults=abs(colMeans(index))
+    }
+  stopCluster(cluster)
+  names(imag)=colnames(mtx)
+  return(imag)
+}
+```
+
+```{r}
+magnitude.outliers=function(model){
+  data=model
+  nout=data$n.out
+  pout=data$outs
+  sample=t(data$sample)
+  pearson=sort(imag.default(sample))
+  kendall=sort(imag.kendall(sample))
+  biweight=sort(imag.biweight(sample))
+  outs.pearson=length(which(names(pearson)[pout]=="mag"))/nout
+  outs.kendall=length(which(names(kendall)[pout]=="mag"))/nout
+  outs.biweight=length(which(names(biweight)[pout]=="mag"))/nout
+  result=data.frame(pearson=outs.pearson,tau=outs.kendall,biweight=outs.biweight)
+return(result)
+}
+```
+
+```{r}
+datos=data.frame()
+i=1
+while(i<101){
+  model=mod.01.mag(100,25,0.05)
+  if(model$n.out!=0){
+    r=magnitude.outliers(model)
+    datos=rbind(datos,r)
+    i=i+1
+  }
+}
+ggplot(data = melt(datos), aes(x=variable, y=value))+ 
+  geom_boxplot()+
+  coord_flip()+
+  xlab("")+
+  ylab("")+
+  ggtitle("Order mixture model 1 (magnitude)")+
+  theme(plot.title = element_text(hjust = 0.5))
+results3=apply(datos,2,mean)
+```
+
+```{r}
+names(results3)=c("MUOD_mag","kendall","Biweight")
+results3
+```
