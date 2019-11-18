@@ -1,0 +1,706 @@
+---
+title: "Robust correlations and outlier detection"
+author: "Josué Cerpa Araña"
+date: "6 de agosto de 2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(rockchalk) #For mvrnorm
+library(parallel)
+library(doParallel)
+library(foreach)
+library(Matrix)
+library(ggplot2)
+require(reshape2)
+library(robustbase)
+library(gridExtra)
+library(WRS2) #for ben and winsor
+library(ccaPP) #for quandrant correlation
+library(DescTools)
+library(asbio)
+```
+
+
+```{r}
+find.tangent.X.intercept <- function(x, y, which.x=which.max(diff(y))+1, plot=F){
+  spl <- smooth.spline(y ~ x)
+  #which.x <- which.max(diff(y))+1 # which.max(x)
+  newx.0 <- x[which.min(diff(diff(y)))]
+  newx.1 <- mean(x[c(which.x-1, which.x)], na.rm=TRUE)
+  pred0 <- predict(spl, x=newx.0, deriv=0)
+  pred1 <- predict(spl, x=newx.1, deriv=1)
+  
+  #slope correction
+  pred1$y <- max(pred1$y, 1.5)
+  
+  y.intercept <- pred0$y - (pred1$y*newx.0)
+  x.intercept <- -y.intercept/pred1$y
+  
+  if( plot ) {
+    plot(x, y, type="l", ylim=c(0,max(y)))
+    abline(h=0, col=8)
+    lines(spl, col=2) # spline
+    points(pred0, col=2, pch=19) # point to predict tangent 
+    lines(x, y.intercept + pred1$y*x, col=3) # tangent (1st deriv. of spline at newx)
+    points(x.intercept, 0, col=3, pch=19) # x intercept
+  }
+  x.intercept
+}
+
+compute_tangent_cutoff <- function(metric, plot=F){
+  cpoint <- find.tangent.X.intercept(seq(0,1,length=length(metric))
+                                     , metric
+                                     #, newx = newx
+                                     , plot = plot)
+  ceiling(cpoint * length(metric))
+}
+
+getOutlierCutoff <- function(curve, method=c("tangent", "deriv", "deriv-enh", "deriv.old", "roc")
+                             , slope=slope, curveName="", plot=FALSE){
+  method <- match.arg(method)
+  
+  curve.seq <- seq(1 / length(curve), 1, by = 1 / length(curve))
+  
+  if( method == "tangent" ){
+    which_best <- compute_tangent_cutoff(curve, plot = plot)
+  } else if( method == "roc" ){ #compute the furthest point between the extreme points
+    which_best <- getFurtherPoint(curve)
+  }else if( method == "deriv" ){ # compute elbow point using 1st derivative
+    #curve.norm2 <- curve / sqrt(sum(curve^2)) # norm-2
+    curve.norm2 <- curve / max(curve) # norm infty
+    targetPoint <- compute_exp_elbow(curve.norm2, slope=slope, enhanced=F, plot=plot) # normalized curve as param
+    which_best <- min(targetPoint, length(curve)+1)
+  }else if( method == "deriv-enh" ){ # compute elbow point using 1st derivative
+    #curve.norm2 <- curve / sqrt(sum(curve^2)) # norm-2
+    curve.norm2 <- curve / max(curve) # norm infty
+    targetPoint <- compute_exp_elbow(curve.norm2, slope=slope, enhanced=T, plot=plot) # normalized curve as param
+    which_best <- min(targetPoint, length(curve)+1)
+  }else if( method == "deriv.old" ){
+    curve.norm2 <- curve / max(curve) # norm infty
+    elbow.point <- compute_exp_elbow.last(curve.norm2, slope=slope, plot=plot) # normalized curve as param
+    metric.seq <- seq(1 / length(curve), 1, by = 1 / length(curve))
+    which_best <- min(which(metric.seq > elbow.point), length(curve)+1)
+  }
+  elbow.point <- curve.seq[which_best]
+  cutoff <- curve[which_best]
+  if( plot ) {
+    plot(curve.seq, curve, type="l", log=""
+         , main=paste0("elbow cut @", (1 - elbow.point) * 100
+                       , "% [", curveName, ifelse(exists("threshold"), paste0("; >=",threshold), ""), "]"))
+    points(elbow.point, cutoff, col="red", pch=4)
+  }
+  cutoff
+}
+```
+
+```{r}
+mod.03.sha = function(n, m, alpha){
+  domain = seq(0, 2*pi,length=m)
+  mu.add1 = sin(domain)
+  mu.add2 = cos(domain)
+  n.out = rbinom(1, n, alpha)
+  n.good = n - n.out
+  if(n.out > 0){
+    outs = as.integer(seq(from = (n - n.out + 1), to = n, by = 1))
+    sd.error = 0.33 # first attempt
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.good = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+    a1 = runif(n.out, 0.75, 1.25)
+    a2 = runif(n.out, 0.75, 1.25)
+    sample.out = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2)) + mvrnorm(n = n.out, rep(0, m), diag(rep(sd.error^2, m)))
+    sample.all = rbind(sample.good, sample.out)
+    rownames(sample.all)[outs]=c("shape")
+    rownames(sample.all)[-outs]=c("user")
+  } else {
+    outs = integer(0)
+    a1 = runif(n.good, 0.75, 1.25)
+    a2 = runif(n.good, 0.75, 1.25)
+    sample.all = (a1%*%t(mu.add1)) + (a2%*%t(mu.add2))
+  }
+  return(list("n.out"=n.out, "outs"=outs, "sample"=sample.all))
+}
+```
+
+#Shape indexes
+
+##Index MUOD shape
+
+$$I_{S_{3}}=\left|\frac{1}{n} \sum_{j=1}^{n} \rho(x,x_j)-1 \right| $$
+
+```{r}
+is.pearson =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  is=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    #pearson-1
+    pearson=cor(mtx, mtx[,splits[[i]]],method = "pearson",use="pairwise.complete.obs")-1
+    #mean and absolute value to the pearson correlation matrix
+    pearson.mean=abs(colMeans(pearson,na.rm=T))
+  }
+  stopCluster(cluster)
+  return(is)
+}
+```
+
+##Index tau kendall
+
+$$I_{S_{2}}=\left|\frac{1}{n} \sum_{j=1}^{n} \tau(x,x_j)-1 \right|$$
+
+```{r}
+#With tau kendall
+is.kendall =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Shape index =
+  is=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    #tau-1
+    tau=cor(mtx, mtx[,splits[[i]]],method = "kendall",use="pairwise.complete.obs")-1
+    #mean and absolute value to the tau correlation matrix
+    tau.mean=abs(colMeans(tau,na.rm=T))
+  }
+  stopCluster(cluster)
+  return(is)
+}
+```
+
+##Index Spearman
+
+$$I_{S_{3}}=\left|\frac{1}{n} \sum_{j=1}^{n} r(x,x_j)-1 \right| $$
+```{r}
+##Shape outliers with spearman
+is.spearman =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  is=foreach(i=1:length(splits),.combine = 'c')  %dopar% {
+    #spearman-1
+    spearman=cor(mtx, mtx[,splits[[i]]],method = "spearman",use="pairwise.complete.obs")-1
+    #mean and absolute value to the spearman correlation matrix
+    spearman.mean=abs(colMeans(spearman,na.rm=T))
+  }
+  stopCluster(cluster)
+  return(is)
+}
+```
+
+##Bend correlation
+https://www.itl.nist.gov/div898/software/dataplot/refman2/auxillar/pbendcr.htm
+
+```{r}
+is.bend=function(data,beta=0.05){
+  bend=pball(data,beta = beta)$pbcorm
+  is= abs(colMeans(bend-1))
+  return(is)
+}
+```
+
+#Winsorized correlation
+
+The standard correlation estimate can be heavily influenced by extreme values. The Winsorized correlation compensates for this by setting the tail values equal to a certain percentile value. For example, for a 90% Winsorized correlation, the bottom 5% of the values are set equal to the value corresponding to the 5th percentile while the upper 5% of the values are set equal to the value corresponding to the 95th percentile. Then the standard correlation formula is applied.
+```{r}
+is.winsor=function(data,beta=0.05){
+  winsor=winall(data,tr = beta)$cor
+  is= abs(colMeans(winsor-1))
+  return(is)
+}
+```
+
+#Quadrant correlation
+
+$$r_Q=\frac{1}{n}\sum_{i=1}^{n} sgn(x_i -med(x)) \, sgn(y_i - med(y))$$
+
+```{r}
+is.quadrant=function(data){
+  quadrant=matrix(,ncol=ncol(data),nrow=ncol(data))
+  for(i in 1:ncol(data)){
+    for(j in 1:ncol(data)){
+      quadrant[j,i]=corQuadrant(data[,i],data[,j])
+    }
+  }
+  return(abs(colMeans(quadrant-1)))
+}
+```
+
+#Robust regression I
+
+$$r_{REG}=\sqrt{\hat{\beta_1} \hat{\beta_2}}$$
+```{r}
+is.robustcor=function(data){
+  cor=matrix(,ncol=ncol(data),nrow=ncol(data))
+  for(i in 1:ncol(data)){
+    for(j in 1:ncol(data)){
+      beta1=cov(data[,i],data[,j])/var(data[,i])
+      beta2=cov(data[,i],data[,j])/var(data[,j])
+      cor[j,i]=sqrt(beta1*beta2)
+    }
+  }
+  return(abs(colMeans(cor-1)))
+}
+```
+
+#Median correlation coefficient 
+
+$$r_{MED}=\frac{med^2 (|u|) \, - \, med^2 (|v|)}{med^2 (|u|) \, + \, med^2 (|v|)}$$
+
+
+where
+
+$$u=\frac{x-med \, (x)}{\sqrt2 \,MAD \,(x)}+\frac{y-med \, (y)}{\sqrt2 \,MAD \, (y)}$$
+$$v=\frac{x-med \, (x)}{\sqrt2 \, MAD \,(x)}-\frac{y-med \, (y)}{\sqrt2 \, MAD \, (y)}$$
+```{r}
+is.median=function(data){
+  #data=apply(X=data,MARGIN = 2,FUN = function(x) (x-min(x))/(max(x)-min(x)))
+  cor=matrix(,ncol=ncol(data),nrow=ncol(data))
+  MAD=apply(data,2,mad)
+  for(i in 1:ncol(data)){
+    for(j in 1:ncol(data)){
+      u=abs((data[,i]-median(data[,i]))/(sqrt(2)*MAD[i]) + (data[,j]-median(data[,j]))/(sqrt(2)*MAD[j]))
+      v=abs((data[,i]-median(data[,i]))/(sqrt(2)*MAD[i]) - (data[,j]-median(data[,j]))/(sqrt(2)*MAD[j]))
+      U=(median(u))^2
+      V=(median(v))^2
+      cor[j,i]=(U-V)/(U+V)
+    }
+  }
+  return(abs(colMeans(cor-1)))
+}
+```
+
+#MAD correlation coefficient
+
+$$r_{MAD}=\frac{MAD^2 (u) \, - \, MAD^2 (v)}{MAD^2 (u) \, + \, MAD^2(v)}$$
+where
+
+$$u=\frac{x-med \, (x)}{\sqrt2 \,MAD \,(x)}+\frac{y-med \, (y)}{\sqrt2 \,MAD \, (y)}$$
+$$v=\frac{x-med \, (x)}{\sqrt2 \, MAD \,(x)}-\frac{y-med \, (y)}{\sqrt2 MAD \, (y)}$$
+```{r}
+is.mad=function(data){
+  #data=apply(X=data,MARGIN = 2,FUN = function(x) (x-min(x))/(max(x)-min(x)))
+  cor=matrix(,ncol=ncol(data),nrow=ncol(data))
+  MAD=apply(data,2,mad)
+  for(i in 1:ncol(data)){
+    for(j in 1:ncol(data)){
+      u=(data[,i]-median(data[,i]))/(sqrt(2)*MAD[i]) + (data[,j]-median(data[,j]))/(sqrt(2)*MAD[j])
+      v=(data[,i]-median(data[,i]))/(sqrt(2)*MAD[i]) - (data[,j]-median(data[,j]))/(sqrt(2)*MAD[j])
+      U=(mad(u))^2
+      V=(mad(v))^2
+      cor[j,i]=(U-V)/(U+V)
+    }
+  }
+  return(abs(colMeans(cor-1)))
+}
+```
+
+#Biweight mid correlation
+
+https://www.itl.nist.gov/div898/software/dataplot/refman2/auxillar/biwmidc.htm
+
+```{r}
+#is.biweight=function(data){
+#  cor=matrix(,ncol=ncol(data),nrow=ncol(data))
+#  for(i in 1:ncol(data)){
+#    for(j in 1:ncol(data)){
+#      cor[j,i]=r.bw(data[,i],data[,j])$r.xy
+#    }
+#  }
+#  return(unname(abs(colMeans(cor-1))))
+#}
+```
+
+```{r}
+is.biweight =  function(mtx,cores=detectCores(),partition=ncol(mtx)/cores){
+  #Number of clusters in terms of the cores
+  cluster = makeCluster(cores)
+  #Necessary to register the parallel backendn
+  registerDoParallel(cluster)
+  #Number of splits for the parallel processing
+  splits <- parallel:::splitList(1:ncol(mtx), max(1, as.integer(partition)))
+  #Users' median
+  MEDIAN=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,median)
+  }
+  #Users' mad
+  MAD=foreach(i=1:length(splits),.combine='c') %dopar% {
+    apply(mtx[,splits[[i]]],2,mad)
+  }
+  #Computation biweight midcovariance#######################
+  ui=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    numerator=t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]]
+    denominator=9*qnorm(0.75)*MAD[splits[[i]]]
+    result=t(numerator/denominator)
+  }
+  ai=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=ui[,splits[[i]]]
+    I1[(-1<=I1) & (I1<=1)]=1
+    I1[(I1< -1) | I1 > 1]=0
+    I1
+  }
+  
+  minusmedian=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    #In ordert to compute user-median(user) we need to make the transpose
+    #of the user's matrix and the end we transpose again.
+    t(t(mtx[,splits[[i]]])-MEDIAN[splits[[i]]])
+  }
+
+  biwmidcov=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:length(splits),.combine='c') %dopar% {
+    #Elements numerator############  
+    ai.x=matrix(ai[,i],ncol = 1)
+    minusmedian.x=matrix(minusmedian[,i],ncol=1)
+    ui.x=(1-matrix(ui[,i],ncol=1)^2)
+    bi.y=data.frame(ai[,splits[[j]]])
+    minusmedian.y=data.frame(minusmedian[,splits[[j]]])
+    vi.y=data.frame((1-ui[,splits[[j]]]^2))
+    
+    #Elements denominator###########
+    ui5.x=(1-5*matrix(ui[,i],ncol=1)^2)
+    vi5.y=data.frame((1-5*ui[,splits[[j]]]^2))
+    
+    #biweight midcovariance
+    numerator.1=ai.x * minusmedian.x * ui.x^2 * bi.y * minusmedian.y *vi.y^2
+    numerator.1.1=nrow(mtx)*apply(numerator.1,2,sum)
+    
+    denominator.1=sum(ai.x * ui.x * ui5.x)
+    denominator.2=bi.y * vi.y * vi5.y 
+    denominator.2.1=apply(denominator.2,2,sum)
+    
+    sbxy=numerator.1.1/(denominator.1 * denominator.2.1)
+    }
+  
+  ai.midvariance=foreach(i=1:length(splits),.combine='cbind') %dopar% {
+    I1=abs(ui[,splits[[i]]])
+    I1[I1<1]=1
+    I1[!(I1=1)]=0
+    I1
+  }
+  
+  biwmidvar=foreach(i=1:length(splits),.combine='c') %dopar% {
+    numerator1=ai.midvariance[,splits[[i]]]*minusmedian[,splits[[i]]]^2 *(1-ui[,splits[[i]]]^2)^4
+    numerator1.1=sqrt(apply(numerator1,2,sum))
+    
+    denominator1=ai.midvariance[,splits[[i]]] * (1-ui[,splits[[i]]]^2) * (1-5*ui[,splits[[i]]]^2)
+    denominator1.1=abs(apply(denominator1,2,sum))
+    
+    ((sqrt(nrow(mtx))*numerator1.1)/denominator1.1)^2
+  }
+  
+  biwmidcor=foreach(i=1:ncol(mtx),.combine='rbind') %:%
+    foreach(j=1:ncol(mtx),.combine='c') %dopar% {
+      biwmidcov[i,j]/sqrt(biwmidvar[i]*biwmidvar[j])
+    }
+  is=foreach(i=1:length(splits),.combine='c') %dopar% {
+    unname(abs(colMeans(biwmidcor[,splits[[i]]]-1)))
+  }
+  stopCluster(cluster)
+  return(is)
+}
+```
+
+
+```{r}
+results=function(x,datos,totalout,tipo){
+  #Names' assigning of outliers and users
+  names(x)=colnames(datos)
+  
+  #Sort of the index in increasing order
+  x=sort(x)
+  
+  #Different cutting methods############################################
+    #Boxplot method
+  out.boxplot=x[x>boxplot.stats(x)$stats[5]]
+  
+    #Adjusted boxplot
+  out.adjboxplot=x[x>adjboxStats(x)$fence[2]]
+  
+    #Adjusted outlyingness
+  AO=NULL
+  for(j in 1:length(x)){
+    if(x[j]>median(x)){
+    AO[j]=(x[j]-median(x))/(adjboxStats(x)$stats[5]-median(x))
+    }else{
+      AO[j]=(median(x)-x[j])/(median(x)-adjboxStats(x)$stats[1])
+    }
+    }
+  out.adjout=AO[AO>adjboxStats(AO)$fence[2]]
+  
+    #Rules Based on Means and Variances
+  meanvar=(x-mean(x))/sd(x)
+  out.meanvar=meanvar[meanvar>2.24]
+  
+    #Carling's Modification
+  n=length(x)
+  k=(17.63*n-23.64)/(7.74*n -3.71)
+  j=floor(n/4 + 5/12) 
+  h=n/4 + 5/12 - j
+  q1=(1-h)*x[j] + h*x[j+1]
+  k.q2=n-j+1
+  q2=(1-h)*x[k.q2] + h * x[k.q2-1]
+  cutoff.carling=median(x)+k*(q2-q1)
+  out.carlings=x[x>cutoff.carling]
+  
+    #MAD-median rule
+  madmedian=(0.6745*(abs(x-median(x))))/mad(x)
+  out.madmedian=madmedian[madmedian>2.24]
+  
+    #Method Based on the Interquartile Range (ideal fourths)
+  cutoff.ifourths=q2 + 1.5*(q2 - q1)
+  out.ifourths=x[x>cutoff.ifourths]
+  
+    #Tangent method
+  cutoff.tangent=getOutlierCutoff(x,"tangent")
+  out.tangent=x[x>cutoff.tangent]
+  
+  #Measures c, f and F for each type of cut#################################
+  
+  #BOXPLOT##################################################################
+  #Correct outlier detection percentage
+  c.boxplot=c((length(which(names(out.boxplot)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.boxplot=c((length(which(names(out.boxplot)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.boxplot=c(length(which(names(out.boxplot)!=tipo)))
+  #False negatives
+  FN.boxplot=c(totalout-length(which(names(out.boxplot)==tipo)))
+  #True positives
+  TP.boxplot=c(length(which(names(out.boxplot)==tipo)))
+  #F measure
+  R.boxplot=c(TP.boxplot/(TP.boxplot+FN.boxplot))
+  P.boxplot=c(TP.boxplot/(TP.boxplot+FP.boxplot))
+  F.measure.boxplot=c((2*R.boxplot*P.boxplot)/(R.boxplot+P.boxplot))
+  
+  #ADJUSTED BOXPLOT#########################################################
+  
+  #Correct outlier detection percentage
+  c.adjboxplot=c((length(which(names(out.adjboxplot)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.adjboxplot=c((length(which(names(out.adjboxplot)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.adjboxplot=c(length(which(names(out.adjboxplot)!=tipo)))
+  #False negatives
+  FN.adjboxplot=c(totalout-length(which(names(out.adjboxplot)==tipo)))
+  #True positives
+  TP.adjboxplot=c(length(which(names(out.adjboxplot)==tipo)))
+  #F measure
+  R.adjboxplot=c(TP.adjboxplot/(TP.adjboxplot+FN.adjboxplot))
+  P.adjboxplot=c(TP.adjboxplot/(TP.adjboxplot+FP.adjboxplot))
+  F.measure.adjboxplot=c((2*R.adjboxplot*P.adjboxplot)/(R.adjboxplot+P.adjboxplot))
+  
+  #ADJUSTED OUTLYINGNESS#########################################################
+  #Correct outlier detection percentage
+  c.adjout=c((length(which(names(out.adjout)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.adjout=c((length(which(names(out.adjout)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.adjout=c(length(which(names(out.adjout)!=tipo)))
+  #False negatives
+  FN.adjout=c(totalout-length(which(names(out.adjout)==tipo)))
+  #True positives
+  TP.adjout=c(length(which(names(out.adjout)==tipo)))
+  #F measure
+  R.adjout=c(TP.adjout/(TP.adjout+FN.adjout))
+  P.adjout=c(TP.adjout/(TP.adjout+FP.adjout))
+  F.measure.adjout=c((2*R.adjout*P.adjout)/(R.adjout+P.adjout))
+  
+  #RULE BASED ON MEAN AND VARIANCES##############################################
+  #Correct outlier detection percentage
+  c.meanvar=c((length(which(names(out.meanvar)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.meanvar=c((length(which(names(out.meanvar)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.meanvar=c(length(which(names(out.meanvar)!=tipo)))
+  #False negatives
+  FN.meanvar=c(totalout-length(which(names(out.meanvar)==tipo)))
+  #True positives
+  TP.meanvar=c(length(which(names(out.meanvar)==tipo)))
+  #F measure
+  R.meanvar=c(TP.meanvar/(TP.meanvar+FN.meanvar))
+  P.meanvar=c(TP.meanvar/(TP.meanvar+FP.meanvar))
+  F.measure.meanvar=c((2*R.meanvar*P.meanvar)/(R.meanvar+P.meanvar))
+  #CARLINGS##################################################################
+  #Correct outlier detection percentage
+  c.carlings=c((length(which(names(out.carlings)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.carlings=c((length(which(names(out.carlings)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.carlings=c(length(which(names(out.carlings)!=tipo)))
+  #False negatives
+  FN.carlings=c(totalout-length(which(names(out.carlings)==tipo)))
+  #True positives
+  TP.carlings=c(length(which(names(out.carlings)==tipo)))
+  #F measure
+  R.carlings=c(TP.carlings/(TP.carlings+FN.carlings))
+  P.carlings=c(TP.carlings/(TP.carlings+FP.carlings))
+  F.measure.carlings=c((2*R.carlings*P.carlings)/(R.carlings+P.carlings))
+  
+  ##MADMEDIAN##################################################################
+  #Correct outlier detection percentage
+  c.madmedian=c((length(which(names(out.madmedian)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.madmedian=c((length(which(names(out.madmedian)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.madmedian=c(length(which(names(out.madmedian)!=tipo)))
+  #False negatives
+  FN.madmedian=c(totalout-length(which(names(out.madmedian)==tipo)))
+  #True positives
+  TP.madmedian=c(length(which(names(out.madmedian)==tipo)))
+  #F measure
+  R.madmedian=c(TP.madmedian/(TP.madmedian+FN.madmedian))
+  P.madmedian=c(TP.madmedian/(TP.madmedian+FP.madmedian))
+  F.measure.madmedian=c((2*R.madmedian*P.madmedian)/(R.madmedian+P.madmedian))
+  
+  ##IDEAL FOURTHS################################################################
+  #Correct outlier detection percentage
+  c.ifourths=c((length(which(names(out.ifourths)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.ifourths=c((length(which(names(out.ifourths)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.ifourths=c(length(which(names(out.ifourths)!=tipo)))
+  #False negatives
+  FN.ifourths=c(totalout-length(which(names(out.ifourths)==tipo)))
+  #True positives
+  TP.ifourths=c(length(which(names(out.ifourths)==tipo)))
+  #F measure
+  R.ifourths=c(TP.ifourths/(TP.ifourths+FN.ifourths))
+  P.ifourths=c(TP.ifourths/(TP.ifourths+FP.ifourths))
+  F.measure.ifourths=c((2*R.ifourths*P.ifourths)/(R.ifourths+P.ifourths))
+  
+  ##TANGENT#######################################################################
+  #Correct outlier detection percentage
+  c.tangent=c((length(which(names(out.tangent)==tipo))/totalout)*100)
+  #False outlier detection percentage
+  f.tangent=c((length(which(names(out.tangent)!=tipo))/(n-totalout))*100)
+  #False positives
+  FP.tangent=c(length(which(names(out.tangent)!=tipo)))
+  #False negatives
+  FN.tangent=c(totalout-length(which(names(out.tangent)==tipo)))
+  #True positives
+  TP.tangent=c(length(which(names(out.tangent)==tipo)))
+  #F measure
+  R.tangent=c(TP.tangent/(TP.tangent+FN.tangent))
+  P.tangent=c(TP.tangent/(TP.tangent+FP.tangent))
+  F.measure.tangent=c((2*R.tangent*P.tangent)/(R.tangent+P.tangent))
+  ###############
+  return(list(cbind(c.boxplot,f.boxplot,F.measure.boxplot,
+                    c.adjboxplot,f.adjboxplot,F.measure.adjboxplot,
+                    c.adjout,f.adjout,F.measure.adjout,
+                    c.meanvar,f.meanvar,F.measure.meanvar,
+                    c.carlings,f.carlings,F.measure.carlings,
+                    c.madmedian,f.madmedian,F.measure.madmedian,
+                    c.ifourths,f.ifourths,F.measure.ifourths,
+                    c.tangent,f.tangent,F.measure.tangent)))
+}
+
+summarizing=function(MATRIX,cores=detectCores()){
+  cluster=makeCluster(cores)
+  registerDoParallel(cluster)
+  newdata=parApply(cl=cluster,X=MATRIX,MARGIN=2,
+                    FUN = function(x) ifelse(is.nan(x)==TRUE,0,x))
+  newdata2=parApply(cl=cluster,X=newdata,MARGIN=2,FUN = mean)
+  stopCluster(cluster)
+  return(newdata2)
+}
+```
+
+```{r}
+muod=function(mod,sim=100,alpha=0.05,cols=100,rows=25,cores=detectCores()){
+  i=1
+  m.pearson=m.kendall=m.spearman=m.bend=m.winsor=m.quadrant=m.robustreg=
+    m.mediancor=m.madcor=m.biweight=matrix(,ncol = 24,nrow = sim)
+  
+  while(i<(sim+1)){
+    if(mod==1){
+      #set.seed(1)
+      #Parameters of the data
+      model=mod.03.sha(cols,rows,alpha)
+      data=t(model$sample)
+      nout=model$n.out
+      out="shape"
+      if(nout!=0){
+        #Indexes
+      pearson=is.pearson(data)
+      kendall=is.kendall(data)
+      spearman=is.spearman(data)
+      bend=is.bend(data)
+      winsor=is.winsor(data)
+      quadrant=is.quadrant(data)
+      robustreg=is.robustcor(data)
+      mediancor=is.median(data)
+      madcor=is.mad(data)
+      biweight=is.biweight(data)
+      indexes=data.frame(pearson=pearson,kendall=kendall,spearman=spearman,
+                         bend=bend,winsor=winsor,quadrant=quadrant,
+                         robustreg=robustreg,mediancor=mediancor,madcor=madcor,
+                         biweight=biweight)
+      
+      #Computation of the different measurements
+      #Number of clusters in terms of the cores
+      #cluster = makeCluster(cores)
+      #Necessary to register the parallel backendn
+      #registerDoParallel(cluster)
+      #Computation of the different measurements
+      R=apply(X=indexes,MARGIN=2,FUN = results,data,nout,out)
+      #Closing the cluster
+      #stopCluster(cluster)
+      m.pearson[i,]=R$pearson[[1]]
+      m.kendall[i,]=R$kendall[[1]]
+      m.spearman[i,]=R$spearman[[1]]
+      m.bend[i,]=R$bend[[1]]
+      m.winsor[i,]=R$winsor[[1]]
+      m.quadrant[i,]=R$quadrant[[1]]
+      m.robustreg[i,]=R$robustreg[[1]]
+      m.mediancor[i,]=R$mediancor[[1]]
+      m.madcor[i,]=R$madcor[[1]]
+      m.biweight[i,]=R$biweight[[1]]
+      i=i+1
+      }
+    }
+  }
+  namescol=c("c","f","F")
+  namesrow=c("boxplot","adjboxplot","adjout","meanvar","carlings","madmedian","ifourths","tangent")
+  pearson.clean=matrix(summarizing(m.pearson),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  kendall.clean=matrix(summarizing(m.kendall),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  spearman.clean=matrix(summarizing(m.spearman),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  bend.clean=matrix(summarizing(m.bend),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  winsor.clean=matrix(summarizing(m.winsor),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  quadrant.clean=matrix(summarizing(m.quadrant),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  robustreg.clean=matrix(summarizing(m.robustreg),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  mediancor.clean=matrix(summarizing(m.mediancor),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  madcor.clean=matrix(summarizing(m.madcor),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  biweight.clean=matrix(summarizing(m.biweight),nrow=8,ncol=3,byrow = TRUE,dimnames= list(namesrow,namescol))
+  
+  return(list(MEASURES.PEARSON=pearson.clean,
+              MEASURES.KENDALL=kendall.clean,
+              MEASURES.SPEARMAN=spearman.clean,
+              MEASURES.BEND=bend.clean,
+              MEASURES.WINSOR=winsor.clean,
+              MEASURES.QUADRANT=quadrant.clean,
+              MEASURES.ROBUSTREG=robustreg.clean,
+              MEASURES.MEDIANCOR=mediancor.clean,
+              MEASURES.MADCOR=madcor.clean,
+              MEASURES.BIWEIGHT=biweight.clean))
+}
+```
+
+
+```{r}
+muod(mod=1)
+```
+
+
